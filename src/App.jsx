@@ -26,12 +26,14 @@ import MobileNav from './components/MobileNav';
 import ToolsSettings from './components/ToolsSettings';
 import QuickSettingsPanel from './components/QuickSettingsPanel';
 
-import { useWebSocket } from './utils/websocket';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { AuthProvider } from './contexts/AuthContext';
+import { TaskMasterProvider } from './contexts/TaskMasterContext';
+import { TasksSettingsProvider } from './contexts/TasksSettingsContext';
+import { WebSocketProvider, useWebSocketContext } from './contexts/WebSocketContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import { useVersionCheck } from './hooks/useVersionCheck';
-import { api } from './utils/api';
+import { api, authenticatedFetch } from './utils/api';
 
 
 // Main App component with routing
@@ -64,13 +66,17 @@ function AppContent() {
     const saved = localStorage.getItem('autoScrollToBottom');
     return saved !== null ? JSON.parse(saved) : true;
   });
+  const [sendByCtrlEnter, setSendByCtrlEnter] = useState(() => {
+    const saved = localStorage.getItem('sendByCtrlEnter');
+    return saved !== null ? JSON.parse(saved) : false;
+  });
   // Session Protection System: Track sessions with active conversations to prevent
   // automatic project updates from interrupting ongoing chats. When a user sends
   // a message, the session is marked as "active" and project updates are paused
   // until the conversation completes or is aborted.
   const [activeSessions, setActiveSessions] = useState(new Set()); // Track sessions with active conversations
   
-  const { ws, sendMessage, messages } = useWebSocket();
+  const { ws, sendMessage, messages } = useWebSocketContext();
 
   useEffect(() => {
     const checkMobile = () => {
@@ -188,6 +194,27 @@ function AppContent() {
       const response = await api.projects();
       const data = await response.json();
       
+      // Always fetch Cursor sessions for each project so we can combine views
+      for (let project of data) {
+        try {
+          const url = `/api/cursor/sessions?projectPath=${encodeURIComponent(project.fullPath || project.path)}`;
+          const cursorResponse = await authenticatedFetch(url);
+          if (cursorResponse.ok) {
+            const cursorData = await cursorResponse.json();
+            if (cursorData.success && cursorData.sessions) {
+              project.cursorSessions = cursorData.sessions;
+            } else {
+              project.cursorSessions = [];
+            }
+          } else {
+            project.cursorSessions = [];
+          }
+        } catch (error) {
+          console.error(`Error fetching Cursor sessions for project ${project.name}:`, error);
+          project.cursorSessions = [];
+        }
+      }
+      
       // Optimize to preserve object references when data hasn't changed
       setProjects(prevProjects => {
         // If no previous projects, just set the new data
@@ -206,7 +233,8 @@ function AppContent() {
             newProject.displayName !== prevProject.displayName ||
             newProject.fullPath !== prevProject.fullPath ||
             JSON.stringify(newProject.sessionMeta) !== JSON.stringify(prevProject.sessionMeta) ||
-            JSON.stringify(newProject.sessions) !== JSON.stringify(prevProject.sessions)
+            JSON.stringify(newProject.sessions) !== JSON.stringify(prevProject.sessions) ||
+            JSON.stringify(newProject.cursorSessions) !== JSON.stringify(prevProject.cursorSessions)
           );
         }) || data.length !== prevProjects.length;
         
@@ -232,11 +260,21 @@ function AppContent() {
       const shouldSwitchTab = !selectedSession || selectedSession.id !== sessionId;
       // Find the session across all projects
       for (const project of projects) {
-        const session = project.sessions?.find(s => s.id === sessionId);
+        let session = project.sessions?.find(s => s.id === sessionId);
         if (session) {
           setSelectedProject(project);
-          setSelectedSession(session);
+          setSelectedSession({ ...session, __provider: 'claude' });
           // Only switch to chat tab if we're loading a different session
+          if (shouldSwitchTab) {
+            setActiveTab('chat');
+          }
+          return;
+        }
+        // Also check Cursor sessions
+        const cSession = project.cursorSessions?.find(s => s.id === sessionId);
+        if (cSession) {
+          setSelectedProject(project);
+          setSelectedSession({ ...cSession, __provider: 'cursor' });
           if (shouldSwitchTab) {
             setActiveTab('chat');
           }
@@ -266,6 +304,15 @@ function AppContent() {
     if (activeTab !== 'git' && activeTab !== 'preview') {
       setActiveTab('chat');
     }
+    
+    // For Cursor sessions, we need to set the session ID differently
+    // since they're persistent and not created by Claude
+    const provider = localStorage.getItem('selected-provider') || 'claude';
+    if (provider === 'cursor') {
+      // Cursor sessions have persistent IDs
+      sessionStorage.setItem('cursorSessionId', session.id);
+    }
+    
     if (isMobile) {
       setSidebarOpen(false);
     }
@@ -586,6 +633,7 @@ function AppContent() {
           autoExpandTools={autoExpandTools}
           showRawParameters={showRawParameters}
           autoScrollToBottom={autoScrollToBottom}
+          sendByCtrlEnter={sendByCtrlEnter}
         />
       </div>
 
@@ -617,6 +665,11 @@ function AppContent() {
             setAutoScrollToBottom(value);
             localStorage.setItem('autoScrollToBottom', JSON.stringify(value));
           }}
+          sendByCtrlEnter={sendByCtrlEnter}
+          onSendByCtrlEnterChange={(value) => {
+            setSendByCtrlEnter(value);
+            localStorage.setItem('sendByCtrlEnter', JSON.stringify(value));
+          }}
           isMobile={isMobile}
         />
       )}
@@ -625,6 +678,7 @@ function AppContent() {
       <ToolsSettings
         isOpen={showToolsSettings}
         onClose={() => setShowToolsSettings(false)}
+        projects={projects}
       />
 
       {/* Version Upgrade Modal */}
@@ -638,14 +692,20 @@ function App() {
   return (
     <ThemeProvider>
       <AuthProvider>
-        <ProtectedRoute>
-          <Router>
-            <Routes>
-              <Route path="/" element={<AppContent />} />
-              <Route path="/session/:sessionId" element={<AppContent />} />
-            </Routes>
-          </Router>
-        </ProtectedRoute>
+        <WebSocketProvider>
+          <TasksSettingsProvider>
+            <TaskMasterProvider>
+              <ProtectedRoute>
+                <Router>
+                  <Routes>
+                    <Route path="/" element={<AppContent />} />
+                    <Route path="/session/:sessionId" element={<AppContent />} />
+                  </Routes>
+                </Router>
+              </ProtectedRoute>
+            </TaskMasterProvider>
+          </TasksSettingsProvider>
+        </WebSocketProvider>
       </AuthProvider>
     </ThemeProvider>
   );
